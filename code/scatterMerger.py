@@ -1,10 +1,27 @@
-"""
-Generates scatterplots comparing all valid sensor pairs within each folder
-(e.g., pre-test or cal-test) for each instrument. 
-Reference sensors are labeled in axis, titles, and saved filenames(start with ref_ if the scatter includes a ref sensor). 
-Rows with invalid data (NaN) 
-are dropped and if there are only a few points, the sensor is not plotted.
-Linear fit and R² are shown.
+"""scatterMerger.py
+
+Simple utility to build pairwise scatter plots for sensors within each CSV.
+
+Overview
+ - Reads formatted CSVs under `SOURCE_ROOT` and, per instrument/folder,
+     builds scatterplots for every sensor pair that have sufficient data.
+ - Reference sensors (containing substrings from `REFERENCE_SENSORS`) are
+     annotated in labels and the filename is prefixed with "ref_" when present.
+
+Behavior notes
+ - Sensor column naming convention: sensors end with a single-character suffix
+     that indicates their type (e.g., 't' for temperature, 'p' for pressure,
+     'r' for relative humidity). The helper `get_allowed_suffix` determines which
+     suffixes are valid per-folder.
+ - Rows with missing timestamps or sensor values are dropped. If fewer than 3
+     valid points remain for a pair, the plot is skipped.
+
+Usage
+    Run from the project root:
+        python3 code/scatterMerger.py
+
+Outputs
+    PNG files are written under `EXPORT_ROOT` organized by instrument/folder.
 """
 
 from pathlib import Path
@@ -134,8 +151,9 @@ def main(src_root: Path, export_root: Path):
 
             for s1, s2 in combinations(filtered, 2):
                 ref1, ref2 = is_reference(s1), is_reference(s2)
-                label1 = f"{s1} (Reference)" if ref1 else s1
-                label2 = f"{s2} (Reference)" if ref2 else s2
+                # For plot readability, label reference series generically as 'ref'
+                label1 = "ref" if ref1 else s1
+                label2 = "ref" if ref2 else s2
 
                 # If either sensor is a temperature sensor, align on temp_reference
                 temp_ref_col = "temp_reference"

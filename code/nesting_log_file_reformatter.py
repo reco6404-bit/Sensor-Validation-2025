@@ -3,19 +3,45 @@ import ast
 import pandas as pd
 from pathlib import Path
 
+"""nesting_log_file_reformatter.py
+
+Tool to convert raw instrument log outputs into the project's "formattedcsv"
+layout. This script contains small parsers for a few vendor/reference formats
+and a workflow to merge and resample logs into a standardized CSV used by the
+plotting code under `code/`.
+
+Key variables (configure at top):
+ - parent_origin: root folder containing raw logs organized by instrument/folder
+ - data_destination: where the parsed/formatted CSVs will be written
+ - reference_files: optional list of reference input files (special parsers apply)
+
+Usage
+    Run from the project root:
+        python3 code/nesting_log_file_reformatter.py
+
+Design notes for readers
+ - Parsers return pandas.DataFrame objects with a `time` column and other
+     numeric columns. The resampler will produce a regular-timeseries CSV
+     (e.g., 0.5-minute averages) saved under `data/formattedcsv`.
+ - LABVIEW timestamps used by some files must be converted to Unix epoch
+     using the LABVIEW_UNIX_OFFSET constant shown below.
+"""
+
 # ================================================================
 # CONFIGURATION
 # ================================================================
-parent_origin = Path("/Users/reesecoleman/Desktop/UCAR Data/data/RawCollection")
-data_destination = Path("/Users/reesecoleman/Desktop/UCAR Data/data/formattedcsv")
+parent_origin = Path("/Users/reesecoleman/Documents/GitHub/Sensor-Validation-2025/data/RawCollection")
+data_destination = Path("/Users/reesecoleman/Documents/GitHub/Sensor-Validation-2025/data/formattedcsv")
 data_destination.mkdir(parents=True, exist_ok=True)
 
 reference_files = [
-    Path("/Users/reesecoleman/Desktop/UCAR Data/data/RawCollection/Temperature_Test/Cal_Test_Data/Super_therm_020425"),
-    Path("/Users/reesecoleman/Desktop/UCAR Data/data/RawCollection/Pressure/Cal_Test_Data/3dpaws_pressure"),
-    Path("/Users/reesecoleman/Desktop/UCAR Data/data/RawCollection/RH_Test/Cal_Test_Data/humidity_chamber_full_header.csv"),  # Only keep the CSV reference for humidity
+        Path("/Users/reesecoleman/Documents/GitHub/Sensor-Validation-2025/data/RawCollection/Temperature_Test/Cal_Test_Data/Super_therm_020425"),
+        Path("/Users/reesecoleman/Documents/GitHub/Sensor-Validation-2025/data/RawCollection/Pressure/Cal_Test_Data/3dpaws_pressure"),
+        Path("/Users/reesecoleman/Documents/GitHub/Sensor-Validation-2025/data/RawCollection/RH_Test/Cal_Test_Data/humidity_chamber_full_header.csv"),  # Only keep the CSV reference for humidity
 ]
 
+# LabVIEW files sometimes use an epoch offset instead of standard Unix time.
+# LABVIEW_UNIX_OFFSET converts LabVIEW epoch to Unix epoch seconds.
 LABVIEW_UNIX_OFFSET = 2082844800
 
 # Set the averaging window (in minutes) for the resampled CSVs

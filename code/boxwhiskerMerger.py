@@ -1,11 +1,24 @@
-"""
-boxwhiskerMerger.py
-------------------------
-For each instrument and child folder, generates box and whisker plots
-grouped by sensor type (first 3 letters) and instrument (last letter).
-Reference sensors are shown as a separate box.
-Annotations for min, Q1, median, Q3, max, and IQR are placed with arrows,
-alternating sides and nudging to avoid overlap.
+"""boxwhiskerMerger.py
+
+Generate readable box-and-whisker plots for each folder of formatted CSVs.
+
+This script groups sensors by type (first three characters of the column
+name) and plots a box for each group plus an optional REFERENCE box. It
+places boxed textual annotations (Min, Max, IQR, Q1, Median, Mean) near each
+box; arrows have been removed in favor of boxed text for cleaner visuals.
+
+Quick usage (from project root):
+    python3 code/boxwhiskerMerger.py
+
+Output
+ - PNG files are saved under `boxPlots/<Instrument>/<Folder>/boxplot_<csv_stem>.png`.
+
+Design notes for a first-time reader
+ - Sensor naming convention: the last character of a column name is treated
+     as the sensor suffix (e.g., 't' for temp, 'p' for pressure, 'r' for RH).
+ - Reference sensor detection uses substrings listed in `REFERENCE_KEYWORDS`.
+ - `base_fontsize` is computed once and applied consistently to ticks, title,
+     labels, and annotation text so the visual scale is predictable across plots.
 """
 
 from pathlib import Path
@@ -38,6 +51,27 @@ def get_allowed_suffix(folder_name: str):
     if first_letter == "r":
         return ("r", "h")
     return (first_letter,)
+
+
+def get_unit_for_instrument(instrument_name: str):
+    """Return an easily readable unit string for the given instrument folder/name.
+
+    Recognized units:
+    - Temperature -> °C
+    - Pressure -> millibars
+    - RH / Relative Humidity -> % RH
+    Returns an empty string when unknown.
+    """
+    if not instrument_name:
+        return ""
+    name = str(instrument_name).lower()
+    if "temp" in name or "temperature" in name:
+        return "°C"
+    if "press" in name or "pressure" in name or "mb" in name:
+        return "millibars"
+    if "rh" in name or "relative" in name or "humidity" in name:
+        return "% RH"
+    return ""
 
 def process_csv(csv_path, instrument, folder, export_root):
     """
@@ -107,18 +141,19 @@ def process_csv(csv_path, instrument, folder, export_root):
     x_positions = np.arange(1, n_boxes * box_spacing + 1, box_spacing)
 
     # --- Plot boxplot ---
-    plt.figure(figsize=(max(10, n_boxes * 2.5), 7))
+    # Make boxes and plot elements larger for readability (increased sizing)
+    plt.figure(figsize=(max(12, n_boxes * 6.0), 16))
     box = plt.boxplot(
-        data, 
+        data,
         patch_artist=True,
         positions=x_positions,
-        widths=0.7,
+        widths=1.8,  # wider boxes
         showmeans=True,
-        boxprops=dict(linewidth=1.5),
-        whiskerprops=dict(linewidth=0.8),   # thinner whiskers
-        capprops=dict(linewidth=0.8),       # thinner caps
-        medianprops=dict(linewidth=1.2, color="orange"),
-        meanprops=dict(marker="D", markerfacecolor="black", markersize=4)
+        boxprops=dict(linewidth=3.6),
+        whiskerprops=dict(linewidth=2.0),
+        capprops=dict(linewidth=2.0),
+        medianprops=dict(linewidth=3.2, color="black"),
+        meanprops=dict(marker="D", markerfacecolor="black", markersize=10)
     )
 
     for patch, color in zip(box['boxes'], colors):
@@ -135,14 +170,19 @@ def process_csv(csv_path, instrument, folder, export_root):
     label_margin = 1.2  # smaller margin to prevent squishing
     plt.xlim(x_positions[0] - label_margin, x_positions[-1] + label_margin)
 
-    plt.xticks(x_positions, labels, rotation=45, ha="right")
-
-    # --- Annotation offsets tuned for tighter layout ---
-    x_offset = 0.6      # right side label distance
-    alt_x_offset = -0.6 # left side label distance
-    base_fontsize = 8
-    min_fontsize = 5
+    # Determine base font size (double the default matplotlib font size) and other
+    # annotation offsets so they are available before tick/label calls.
+    base_fontsize = int(plt.rcParams.get('font.size', 10) * 2)
+    min_fontsize = 10
     min_gap = 0.35
+    x_offset = 1.2      # right side label distance (scaled up)
+    alt_x_offset = -1.2 # left side label distance
+
+    plt.xticks(x_positions, labels, rotation=45, ha="right")
+    # Make tick labels larger
+    ax = plt.gca()
+    ax.tick_params(axis='x', labelsize=base_fontsize)
+    ax.tick_params(axis='y', labelsize=base_fontsize)
 
     # --- Annotate each box with non-overlapping labels ---
     from matplotlib.transforms import Bbox
@@ -170,18 +210,20 @@ def process_csv(csv_path, instrument, folder, export_root):
 
         # --- Min/Max as simple labels, no arrows, no shifting ---
         plt.text(x, minv - y_range * 0.03, f"Min\n{minv:.2f}",
-                 ha='center', va='top', fontsize=8, color='blue',
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=1.2))
+                 ha='center', va='top', fontsize=base_fontsize, color='blue',
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=2.4))
         plt.text(x, maxv + y_range * 0.03, f"Max\n{maxv:.2f}",
-                 ha='center', va='bottom', fontsize=8, color='blue',
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=1.2))
+                 ha='center', va='bottom', fontsize=base_fontsize, color='blue',
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=2.4))
 
         # --- IQR inside the box ---
         iqr_y = (q1 + q3) / 2
+        # Use a dark color (not yellow/orange) for IQR so it is legible on white
+        iqr_color = 'black'
         plt.text(
             x, iqr_y, f"IQR\n{iqr:.2f}",
-            ha='center', va='center', fontsize=8, color='orange',
-            bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=1.2)
+            ha='center', va='center', fontsize=base_fontsize, color=iqr_color,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=2.4)
         )
 
         # --- Q1, Median, Q3, Mean: alternate right/left, stack vertically, always point to stat ---
@@ -210,17 +252,23 @@ def process_csv(csv_path, instrument, folder, export_root):
 
         for (label, y0, color, x_offset, ha), y_annot in zip(label_defs, stack_positions):
             x_annot = x + x_offset
-            plt.annotate(
+            # Ensure text color is not yellow (poor contrast on white)
+            bad_colors = {"yellow", "#ffff00", "brightyellow", "gold"}
+            color_safe = color if (isinstance(color, str) and color.lower() not in bad_colors) else "black"
+            # Place the label near the statistic without an arrow connector.
+            # Use text with a boxed background so it remains legible.
+            plt.text(
+                x_annot, y_annot,
                 f"{label}\n{(iqr if label=='IQR' else y0):.2f}",
-                xy=(x, y0),
-                xytext=(x_annot, y_annot),
-                ha=ha, va='center', fontsize=8, color=color,
-                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=1.2),
-                arrowprops=dict(arrowstyle="->", color=color, lw=1)
+                ha=ha, va='center', fontsize=base_fontsize, color=color_safe,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='black', lw=2.4)
             )
 
-    plt.title(f"{instrument} - {folder}\nSensor Value Distributions")
-    plt.ylabel("Sensor Value")
+    # Include units in the y-label when available
+    unit = get_unit_for_instrument(instrument)
+    y_label = f"Sensor Value ({unit})" if unit else "Sensor Value"
+    plt.title(f"{instrument} - {folder}\nSensor Value Distributions", fontsize=base_fontsize+2)
+    plt.ylabel(y_label, fontsize=base_fontsize)
     plt.grid(True, axis="y", linestyle="--", alpha=0.5)
     plt.tight_layout()
 

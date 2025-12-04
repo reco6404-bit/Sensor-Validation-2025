@@ -5,70 +5,33 @@ masking_window_size = 3000  # Change this value to control the number of points 
 # Hysteresis detection defaults (absolute difference in %RH and minimum duration in seconds)
 HYSTERESIS_THRESHOLD = 1.0  # percent points of RH considered hysteresis
 HYSTERESIS_MIN_DURATION_SECONDS = 10  # minimum duration to report a hysteresis period
-"""
-differencePlotter.py
----------------------
-This script generates a set of difference plots for sensor datasets Each generated plot shows how each sensor
-deviates from the chosen reference over time.
+"""differencePlotter.py
 
-Main steps performed by the program:
+Produce difference plots (sensor - reference) from formatted CSV files.
 
-1) Configuration and CSV discovery
-     - Constants at the top control paths, thresholds and which plots to create.
-     - The script walks the `SOURCE_ROOT` folder for CSV files and collects
-         them for processing.
+What this script does:
+ - For each CSV it finds a reference sensor (configured via `REFERENCE_SENSORS`) and
+     computes sensor - reference differences for all non-reference sensors.
+ - Special-case handling for humidity: detect and mask/interpolate spikes so
+     the resulting plots show stable plateaus. Hysteresis detection is available
+     and the script also exports per-sensor precision CSVs.
+ - Axis presets in `AXIS_PRESETS` may be used to force consistent y-limits
+     and tick steps for specific instruments (e.g., RH or temperature plots).
 
-2) CSV loading and canonicalization
-     - Each CSV is parsed with `time` parsed to datetimes.
-     - Columns are filtered to determine which are sensors and which are
-         reference columns based on suffix rules and a small reference-name list.
-     - Rows are trimmed to the period where the reference contains data (if
-         `RESTRICT_TO_REFERENCE_TIME` is enabled) so comparisons use overlapping time.
+Usage
+    Run from the project root:
+        python3 code/differencePlotter.py
 
-3) Difference computation and spike handling
-     - For every sensor the script computes `diff = sensor - reference`.
-     - For humidity data, short-duration spikes are detected and removed via
-         interpolation (helper: `detect_spikes` + `remove_spikes`).  Alternatively
-         a spike-mask is available (helper: `build_spike_mask`) so masked points
-         can be left as gaps in plots if desired.
-     - A centered moving-average smoothing is applied so plotted series are
-         visually comparable and short noise is reduced.
+Outputs
+    PNGs are written to `differencePlots/<Instrument>/` and a per-CSV
+    sensor precisions CSV is exported alongside the images.
 
-4) Per-sensor precision estimate
-     - The script computes a simple precision metric for each sensor: the mean
-         absolute difference from the reference after spike-removal and smoothing.
-     - This precision value is added to the sensor label in all legends so
-         readers can quickly see typical absolute deviation for each sensor.
-
-5) Defensive plotting and alignment
-     - All series are aligned to a common time base using `align_time_and_series`.
-     - `safe_plot` checks length mismatches and logs/omits a single problematic
-         series rather than aborting the whole CSV processing.
-
-6) Plot types created
-     - All-sensors difference plot: every sensor's difference from the reference.
-     - Temperature overlay: same differences but with a twin axis that overlays
-         the reference temperature series when available.
-     - Reference overlay (smoothed): differences plotted on one axis and the
-         raw reference overlaid on a secondary axis; for humidity the reference
-         axis is forced to 0..100 with ticks every 10 units.
-     - Sensor-type averages: per-sensor-family averaged difference plots.
-
-7) Special handling for humidity data
-     - The script detects large step-like plateaus in the reference humidity and
-         prints each plateau's start, end and duration for inspection.
-     - Masking around plateau boundaries can be applied so transient spikes do
-         not appear on any humidity-related plots.
-
-8) Output and bookkeeping
-     - Each plot is saved to `EXPORT_ROOT/<instrument>/...` with descriptive
-         filenames. The script prints saved paths and summary lines to the console.
-
-Helpers and extensibility
-     - The code is organized into small helpers: loading, alignment, spike
-         detection/removal, axis-tick generation, and plotting helpers.
-     - Thresholds, smoothing windows, and behavior flags are set as top-level
-         variables to make it straightforward to tune detection and plotting.
+Implementation notes for new readers
+ - This module is defensive: it avoids in-place interpolation of the input
+     DataFrame and instead applies boolean masks at plotting time so raw data
+     are preserved for reproducibility.
+ - Many helpers (spike detection, tick calculation, legend placement) are
+     intentionally small and documented near their definitions.
 """
 
 from pathlib import Path
@@ -102,6 +65,16 @@ PLOT_HOURS = .5        # How many hours to plot if PLOT_ONE_HOUR is True (suppor
 
 BEGIN_EDGE_CUT_PERCENT = 0.03  # percent to cut from the beginning edge (for x-axis bounds only)
 END_EDGE_CUT_PERCENT = 0.12    # percent to cut from the ending edge (for x-axis bounds only)
+
+# ---------- AXIS PRESETS (manual override) ---------- #
+# Format: {"instrument_name": (ymin, ymax, step)}
+AXIS_PRESETS = {
+    # Example manual overrides (lowercase instrument keys):
+    "rh_test": (-8, 10, 2.0),
+    "pressure": (-6.5, 1.5, 0.5),
+    "temperature": (-0.5, 0.5, 0.1),
+}
+
 
 # ---------- HELPER FUNCTIONS ---------- #
 
@@ -193,14 +166,29 @@ def find_reference_temp(df):
     temp_cols = [c for c in df.columns if c.lower().endswith("t")]
     return temp_cols[0] if temp_cols else None
 
-# ---------- AXIS PRESETS (manual override) ---------- #
-# Format: {"instrument_name": (ymin, ymax, step)}
-AXIS_PRESETS = {
-    # Example:
-    "rh_test": (-5, 10, 5.0),
-    "pressure": (-6.5, 1.5, 0.5)
-    # "temperature": (-1, 1, 0.1),
-}
+# Temperature tick step (degrees) used when rounding temperature axes
+TEMP_TICK_STEP = 5
+
+
+def find_axis_preset_for_instrument(instrument: str):
+    """Return a preset tuple (min, max, step) for `instrument` using flexible matching.
+    Matching tries exact lowercase key, then substring/prefix matches against keys in AXIS_PRESETS.
+    Returns None if no preset found.
+    """
+    if not instrument:
+        return None
+    inst = instrument.lower()
+    # exact match
+    if inst in AXIS_PRESETS:
+        return AXIS_PRESETS[inst]
+    # try substring/prefix matches (e.g., 'temperature_test' should match 'temperature')
+    for k, v in AXIS_PRESETS.items():
+        try:
+            if k in inst or inst.startswith(k) or inst.endswith(k):
+                return v
+        except Exception:
+            continue
+    return None
 
 def get_nice_axis_limits_and_ticks(data, n_ticks=6, instrument=None, force_no_preset=False):
     """
@@ -208,10 +196,12 @@ def get_nice_axis_limits_and_ticks(data, n_ticks=6, instrument=None, force_no_pr
     Axis will start at a multiple of 0.5 if possible.
     If AXIS_PRESETS is set for the instrument, use those values unless force_no_preset is True.
     """
-    if not force_no_preset and instrument is not None and instrument.lower() in AXIS_PRESETS:
-        ymin, ymax, step = AXIS_PRESETS[instrument.lower()]
-        yticks = np.arange(ymin, ymax + step * 0.5, step)
-        return ymin, ymax, yticks
+    if not force_no_preset and instrument is not None:
+        preset = find_axis_preset_for_instrument(instrument)
+        if preset is not None:
+            ymin, ymax, step = preset
+            yticks = np.arange(ymin, ymax + step * 0.5, step)
+            return ymin, ymax, yticks
 
     finite_data = np.array(data)[np.isfinite(data)]
     if finite_data.size == 0:
@@ -239,8 +229,9 @@ def get_nice_axis_limits_and_ticks(data, n_ticks=6, instrument=None, force_no_pr
 
     # Try steps in order to find a reasonable number of ticks (4..12)
     for step in candidate_steps:
-        y_min = np.floor(dmin / step) * step
-        y_max = np.ceil(dmax / step) * step
+        # round extremes to multiples of 'step' but ensure we ROUND UP the top
+        y_min = math.floor(dmin / step) * step
+        y_max = math.ceil(dmax / step) * step
         if y_max <= y_min:
             y_max = y_min + step
         n_ticks_try = int(round((y_max - y_min) / step)) + 1
@@ -254,14 +245,80 @@ def get_nice_axis_limits_and_ticks(data, n_ticks=6, instrument=None, force_no_pr
     if chosen_ymin is None:
         step = candidate_steps[-1]
         chosen_step = step
-        chosen_ymin = np.floor(dmin / step) * step
-        chosen_ymax = np.ceil(dmax / step) * step
+        chosen_ymin = math.floor(dmin / step) * step
+        chosen_ymax = math.ceil(dmax / step) * step
         if chosen_ymax <= chosen_ymin:
             chosen_ymax = chosen_ymin + step
 
+    # Build tick array
+    # Build tick array and ensure top tick is at or above the true data max
     yticks = np.arange(chosen_ymin, chosen_ymax + chosen_step * 0.5, chosen_step)
-    if np.all(np.isclose(yticks, np.round(yticks))):
-        yticks = yticks.astype(int)
+
+    # Special-case: prefer whole-number ticks for humidity/RH instruments
+    if instrument is not None:
+        inst = instrument.lower()
+        try:
+            # humidity instrument -> integer % RH ticks
+            if "humidity" in inst or inst.startswith("rh") or "rh_test" in inst:
+                # Use integer %RH ticks and ensure we round the top tick UP so it
+                # is never below the actual maximum value in the data.
+                ymin_i = int(math.floor(dmin))
+                ymax_i = int(math.ceil(dmax))
+                if ymin_i == ymax_i:
+                    ymin_i -= 1
+                    ymax_i += 1
+                # Ensure the returned ymax covers the actual max (round up)
+                if float(ymax_i) < float(dmax) - 1e-9:
+                    ymax_i = int(math.ceil(float(dmax)))
+                yticks = np.arange(ymin_i, ymax_i + 1, 1)
+                return float(ymin_i), float(ymax_i), yticks.astype(int)
+            # temperature instrument -> use TEMP_TICK_STEP multiples
+            if "temp" in inst or inst.endswith("_t") or "temperature" in inst:
+                # Use fixed TEMP_TICK_STEP multiples and ROUND UP the top tick so
+                # the highest tick is >= the actual maximum value.
+                step = TEMP_TICK_STEP
+                ymin_t = int(math.floor(dmin / step) * step)
+                # Round up using math.ceil to ensure top tick >= dmax
+                ymax_t = int(math.ceil(float(dmax) / float(step)) * step)
+                if ymax_t <= ymin_t:
+                    ymax_t = ymin_t + step
+                yticks = np.arange(ymin_t, ymax_t + step, step)
+                # limit number of ticks similar to general logic
+                max_ticks = 8
+                if len(yticks) > max_ticks:
+                    s = int(np.ceil(len(yticks) / float(max_ticks)))
+                    yticks = yticks[::s]
+                return float(ymin_t), float(ymax_t), yticks.astype(int)
+        except Exception:
+            # on any error, fall back to the generic ticks below
+            pass
+
+    # Ensure the last tick is at or above the actual data max (avoid labels lower than plotted lines)
+    try:
+        if len(yticks) == 0:
+            yticks = np.array([chosen_ymin, chosen_ymax])
+        # If due to subsampling the last tick falls below the data max, append the rounded max
+        if float(yticks[-1]) < float(dmax) - 1e-9:
+            # determine step to append: prefer chosen_step when available
+            step = chosen_step if 'chosen_step' in locals() and chosen_step is not None else (yticks[-1] - yticks[-2] if len(yticks) >= 2 else (float(chosen_ymax) - float(chosen_ymin)))
+            append_tick = float(yticks[-1]) + float(step)
+            # round append_tick to a sensible value
+            yticks = np.concatenate([yticks, np.array([append_tick])])
+
+        if np.all(np.isfinite(yticks)) and np.all(np.isclose(yticks, np.round(yticks))):
+            yticks = yticks.astype(int)
+    except Exception:
+        pass
+
+    # Ensure returned ymax covers the highest tick (we may have appended a tick)
+    try:
+        chosen_ymin = float(chosen_ymin)
+        chosen_ymax = float(chosen_ymax)
+        if len(yticks) > 0:
+            chosen_ymax = max(chosen_ymax, float(yticks[-1]))
+            chosen_ymin = min(chosen_ymin, float(yticks[0]))
+    except Exception:
+        pass
     return float(chosen_ymin), float(chosen_ymax), yticks
 
 
@@ -460,8 +517,9 @@ def print_spike_periods(spike_periods, time_index, sensor_name=None, csv_path=No
     - spike_periods: list of (start_idx, end_idx)
     - time_index: pandas Series or array-like of timestamps (must indexable by integer positions)
     """
-    # Silent by default to avoid noisy per-spike console output.
-    # To enable printing, pass verbose=True when calling this helper.
+    # Intentionally silent by default to avoid noisy per-spike output during
+    # bulk processing. If you want visible spike logging, replace this body
+    # with a loop that prints timestamps/durations for each (start, end).
     return
 
 
@@ -709,6 +767,24 @@ def process_csv(
     plot_individual_groups: bool = True
 ):
     instrument = csv_path.parts[-3]
+    # --- Apply per-instrument axis preset override early ---
+    # If a preset exists for this instrument in AXIS_PRESETS, set initial
+    # y_min/y_max/ticks here so later plotting branches inherit the same
+    # bounds (mirrors behavior in graphMerger.py).
+    y_min_rounded = None
+    y_max_rounded = None
+    y_ticks = None
+    try:
+        preset = find_axis_preset_for_instrument(instrument)
+        if preset is not None:
+            preset_min, preset_max, preset_step = preset
+            y_min_rounded = float(preset_min)
+            y_max_rounded = float(preset_max)
+            y_ticks = np.arange(preset_min, preset_max + preset_step * 0.5, preset_step)
+    except Exception:
+        y_min_rounded = None
+        y_max_rounded = None
+        y_ticks = None
     if "pre-test" in instrument.lower() or "pre-test" in csv_path.name.lower():
         print(f"⚠️ Skipping plot for {csv_path.name}: instrument or file contains 'pre-test'")
         return
@@ -880,12 +956,50 @@ def process_csv(
     except Exception as e:
         print(f"⚠️ Failed to export precisions CSV for {csv_path}: {e}")
 
-    # --- Use improved axis logic for y-limits and ticks ---
-    if all_diffs:
-        diffs_concat = np.concatenate([d[np.isfinite(d)] for d in all_diffs if np.any(np.isfinite(d))])
-        y_min_rounded, y_max_rounded, y_ticks = get_nice_axis_limits_and_ticks(diffs_concat, n_ticks=n_y_ticks, instrument=instrument)
-    else:
-        y_min_rounded, y_max_rounded, y_ticks = -1, 1, np.arange(-1, 1.1, 0.5)
+    # --- Use improved axis logic for y-limits and ticks (only if not preset) ---
+    # If an axis preset was applied earlier (y_min_rounded is not None) do
+    # not overwrite it; otherwise compute data-driven limits. For temperature
+    # difference plots we choose a small symmetric range around zero where
+    # appropriate (e.g. -1..1 with 0.2 ticks) so small differences are easy
+    # to inspect.
+    if y_min_rounded is None:
+        if all_diffs:
+            diffs_concat = np.concatenate([d[np.isfinite(d)] for d in all_diffs if np.any(np.isfinite(d))])
+            # Compute raw min/max for custom per-instrument logic
+            try:
+                dmin = float(np.nanmin(diffs_concat))
+                dmax = float(np.nanmax(diffs_concat))
+            except Exception:
+                dmin, dmax = -1.0, 1.0
+
+            # Temperature-specific presets: prefer a small symmetric window
+            # around zero when measured diffs are small. This yields examples
+            # like -1..1 with 0.2 ticks when the data support that granularity.
+            try:
+                if "temperature" in instrument.lower():
+                    max_abs = max(abs(dmin), abs(dmax))
+                    if max_abs <= 1.0:
+                        bound = 1.0
+                        step = 0.2
+                    elif max_abs <= 2.0:
+                        bound = 2.0
+                        step = 0.5
+                    else:
+                        # For larger spreads choose a sensible step from candidates
+                        candidates = [0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+                        raw_step = (2.0 * max_abs) / float(max(4, n_y_ticks))
+                        step = next((c for c in candidates if c >= raw_step), candidates[-1])
+                        bound = math.ceil(max_abs / step) * step
+                    y_min_rounded = -float(bound)
+                    y_max_rounded = float(bound)
+                    y_ticks = np.arange(y_min_rounded, y_max_rounded + step / 2.0, step)
+                else:
+                    y_min_rounded, y_max_rounded, y_ticks = get_nice_axis_limits_and_ticks(diffs_concat, n_ticks=n_y_ticks, instrument=instrument)
+            except Exception:
+                # fallback to generic helper on any failure
+                y_min_rounded, y_max_rounded, y_ticks = get_nice_axis_limits_and_ticks(diffs_concat, n_ticks=n_y_ticks, instrument=instrument)
+        else:
+            y_min_rounded, y_max_rounded, y_ticks = -1, 1, np.arange(-1, 1.1, 0.5)
     # (plotting continues after trimmed_diffs is computed below)
 
     # Defensive alignment: trim time_vals and diffs to the same minimum length to avoid x/y dimension mismatch
@@ -907,7 +1021,8 @@ def process_csv(
         # Draw an interpolated dotted line (labelled) to connect gaps, then
         # overplot the smoothed/actual series without a label so the legend
         # contains only one entry per sensor.
-        label = f"{sensor} - {ref}"
+        # Use a short generic reference label in plots (do not embed the full column name)
+        label = f"{sensor} - ref"
         try:
             diff_series = pd.Series(diff).reset_index(drop=True)
             diff_interp = diff_series.interpolate(method='linear', limit_direction='both')
@@ -930,7 +1045,8 @@ def process_csv(
         plt.axhline(0, color="black", linestyle="--", linewidth=1)
         plt.xlabel("Time")
         units = get_unit_for_instrument(instrument)
-        ylabel = f"Difference from {ref} ({units})" if units else f"Difference from {ref}"
+        # Use generic 'ref' in axis labels to avoid long column names on the plot
+        ylabel = f"Difference from ref ({units})" if units else f"Difference from ref"
         plt.ylabel(ylabel)
         plt.title(f"{instrument} - SENSOR DIFFERENCES ({csv_path.stem})")
         plt.ylim(y_min_rounded, y_max_rounded)
@@ -951,9 +1067,18 @@ def process_csv(
         plt.draw()
 
         plt.grid(True, linestyle="--", alpha=0.5)
-        save_path = out_dir / f"allSensorsDiff_{csv_path.stem}.png"
+        save_path = out_dir / f"{instrument}_allSensorsDiff_{csv_path.stem}.png"
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"✅ Saved: {save_path}")
+        # Print tick labels and plotted data min/max for diagnostics
+        try:
+            tick_min = y_ticks[0] if hasattr(y_ticks, '__len__') and len(y_ticks) > 0 else y_min_rounded
+            tick_max = y_ticks[-1] if hasattr(y_ticks, '__len__') and len(y_ticks) > 0 else y_max_rounded
+            data_min = float(np.nanmin(plotted_fin)) if plotted_fin.size > 0 else float('nan')
+            data_max = float(np.nanmax(plotted_fin)) if plotted_fin.size > 0 else float('nan')
+            print(f"TICKS (primary y): {tick_min} -> {tick_max} | DATA (primary y): {data_min:.2f} -> {data_max:.2f}")
+        except Exception:
+            pass
         plt.close()
     else:
         plt.close()
@@ -989,7 +1114,7 @@ def process_csv(
             temp_trimmed = [d.reset_index(drop=True).iloc[:len(time_trim2)] if hasattr(d, 'reset_index') else pd.Series(d).iloc[:len(time_trim2)] for d in temp_all]
         for sensor, diff in zip([s for s in valid_sensors if s != ref], temp_trimmed):
             precision = sensor_precisions.get(sensor, float('nan'))
-            label = f"{sensor} - {ref}"
+            label = f"{sensor} - ref"
             try:
                 diff_series = pd.Series(diff).reset_index(drop=True)
                 diff_interp = diff_series.interpolate(method='linear', limit_direction='both')
@@ -1013,7 +1138,7 @@ def process_csv(
             ax1.axhline(0, color="black", linestyle="--", linewidth=1)
             ax1.set_xlabel("Time")
             units = get_unit_for_instrument(instrument)
-            ylabel = f"Difference from {ref} ({units})" if units else f"Difference from {ref}"
+            ylabel = f"Difference from ref ({units})" if units else f"Difference from ref"
             ax1.set_ylabel(ylabel)
             ax1.set_title(f"{instrument} - SENSOR DIFFERENCES + REF TEMP ({csv_path.stem})")
             ax1.set_ylim(y_min_rounded, y_max_rounded)
@@ -1044,8 +1169,14 @@ def process_csv(
         # to reduce the ticks to at most max_ticks while keeping round values.
         max_ticks = 8
         if len(t_ticks) > max_ticks:
-            step = int(np.ceil(len(t_ticks) / float(max_ticks)))
-            t_ticks = t_ticks[::step]
+            # Choose up to `max_ticks` tick positions while ensuring the
+            # highest tick (top of axis) is always included. Use evenly
+            # spaced indices from 0..n-1 and pick unique integer positions
+            # so we never drop the end tick via simple slicing.
+            n = len(t_ticks)
+            # linspace from 0 to n-1 with max_ticks points, round to nearest int
+            idxs = np.unique(np.round(np.linspace(0, n - 1, max_ticks)).astype(int))
+            t_ticks = t_ticks[idxs]
         ax2 = ax1.twinx()
         # align time and temp_vals
         try:
@@ -1066,7 +1197,16 @@ def process_csv(
         safe_plot(ax2, time_trim3, temp_trim, csv_path=csv_path, sensor_name=f"REF TEMP: {temp_ref_col} (points)", label=None, linestyle='none', marker='o', markersize=3, color='red', alpha=0.8, zorder=3)
         ax2.set_ylabel("Reference Temperature (°C)")
         ax2.set_ylim(tmin_rounded, tmax_rounded)
-        ax2.set_yticks(t_ticks)
+        # Use FixedLocator to force the ticks we computed. This ensures matplotlib
+        # does not auto-adjust the tick positions when rendering/saving.
+        try:
+            ax2.yaxis.set_major_locator(FixedLocator(t_ticks))
+        except Exception:
+            # fallback to set_yticks if FixedLocator fails for any reason
+            try:
+                ax2.set_yticks(t_ticks)
+            except Exception:
+                pass
         # keep tick labels visible (we already reduced tick count above)
 
         ax1.yaxis.grid(True, linestyle="--", alpha=0.5)
@@ -1080,8 +1220,10 @@ def process_csv(
         legend1, legend2 = place_legends_outside(fig, ax1, lines1, labels1, ax2, lines2, labels2)
         plt.draw()
 
-        plt.savefig(out_dir / f"allSensorsDiffTempOverlay_{csv_path.stem}.png", dpi=150, bbox_inches="tight")
-        print(f"✅ Saved: {out_dir / f'allSensorsDiffTempOverlay_{csv_path.stem}.png'}")
+        save_path = out_dir / f"{instrument}_allSensorsDiffTempOverlay_{csv_path.stem}.png"
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"✅ Saved: {save_path}")
+        # Diagnostic tick/data printing removed to reduce console noise.
         plt.close()
 
 
@@ -1134,6 +1276,13 @@ def process_csv(
     if avg_diff_dict:
         for sensor_type, avg_diff in avg_diff_dict.items():
             plt.figure(figsize=(12, 6))
+            # Choose a non-red color for this sensor-type average using the same
+            # cycle-avoidance logic as used for individual sensors so we do not
+            # accidentally use reserved red shades for averages.
+            try:
+                group_color, color_idx = pick_nonred_color(color_cycle, color_idx)
+            except Exception:
+                group_color = None
             # Apply spike detection and masking for humidity instruments
             avg_diff_plot = avg_diff
             if instrument.lower() in ("humidity", "rh_test"):
@@ -1155,15 +1304,15 @@ def process_csv(
                 avg_interp = avg_trim
             if do_connect:
                 # Show connector as dotted but unlabeled, label the solid averaged series
-                safe_plot(plt.gca(), time_trim_avg, avg_interp, csv_path=csv_path, sensor_name=f"{sensor_type} avg", label=None, linestyle=':', alpha=0.9)
-                safe_plot(plt.gca(), time_trim_avg, avg_trim, csv_path=csv_path, sensor_name=f"{sensor_type} avg", label=f"{sensor_type} avg - {ref}", linestyle='-', alpha=0.9)
+                safe_plot(plt.gca(), time_trim_avg, avg_interp, csv_path=csv_path, sensor_name=f"{sensor_type} avg", label=None, linestyle=':', alpha=0.9, color=group_color)
+                safe_plot(plt.gca(), time_trim_avg, avg_trim, csv_path=csv_path, sensor_name=f"{sensor_type} avg", label=f"{sensor_type} avg - ref", linestyle='-', alpha=0.9, color=group_color)
             else:
                 # For non-temperature instruments, plot the averaged series labeled only
-                safe_plot(plt.gca(), time_trim_avg, avg_trim, csv_path=csv_path, sensor_name=f"{sensor_type} avg", label=f"{sensor_type} avg - {ref}", linestyle='-', alpha=0.9)
+                safe_plot(plt.gca(), time_trim_avg, avg_trim, csv_path=csv_path, sensor_name=f"{sensor_type} avg", label=f"{sensor_type} avg - ref", linestyle='-', alpha=0.9, color=group_color)
             plt.axhline(0, color="black", linestyle="--", linewidth=1)
             plt.xlabel("Time")
             units = get_unit_for_instrument(instrument)
-            ylabel = f"Difference from {ref} ({units})" if units else f"Difference from {ref}"
+            ylabel = f"Difference from ref ({units})" if units else f"Difference from ref"
             plt.ylabel(ylabel)
             plt.title(f"{instrument} - {sensor_type.upper()} SENSOR TYPE AVERAGED DIFFERENCE ({csv_path.stem})")
             plt.ylim(y_min_rounded, y_max_rounded)
@@ -1175,7 +1324,7 @@ def process_csv(
             add_edge_labels_if_needed(ax, time_vals)
             plt.legend(loc="best", frameon=True, fontsize=10, handlelength=2)
             plt.grid(True, linestyle="--", alpha=0.5)
-            save_path = out_dir / f"{sensor_type.upper()}_allSensorTypeAvgDiff_{csv_path.stem}.png"
+            save_path = out_dir / f"{instrument}_{sensor_type.upper()}_allSensorTypeAvgDiff_{csv_path.stem}.png"
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
             print(f"✅ Saved: {save_path}")
             plt.close()
@@ -1340,39 +1489,70 @@ def plot_reference_overlay(
         # Now merge all cut_intervals (spikes + plateaus) into timestamped merged intervals
         try:
             merged_cut = merge_time_intervals(cut_intervals, df_clean["time"], merge_gap_seconds=1)
-            if merged_cut:
-                print(f"CUT PERIODS for {csv_path.name}:")
-                for st, en, dur, sources in merged_cut:
-                    try:
-                        dur_str = _format_duration(st, en) if st is not None and en is not None else 'unknown'
-                        src_list = ','.join(sorted(sources))
-                        print(f"CUT: {st} -> {en} (duration {dur_str}) sources={src_list}")
-                    except Exception:
-                        print(f"CUT: idx-range unknown, sources={sources}")
+            # merged_cut detected; detailed CUT period printing suppressed to avoid
+            # excessive console output. The merged_cut list is still available for
+            # future logging or export if desired.
         except Exception:
             pass
 
         # Detect hysteresis periods on the (masked) difference DataFrame and print
         try:
             hysteresis = detect_hysteresis_periods(diff_df, df_clean["time"], threshold=HYSTERESIS_THRESHOLD, min_duration_seconds=HYSTERESIS_MIN_DURATION_SECONDS)
-            if hysteresis:
-                print(f"HYSTERESIS PERIODS for {csv_path.name}:")
-                for sensor_name, periods in hysteresis.items():
-                    for start_ts, end_ts, duration_td, mean_diff, peak_diff in periods:
-                        try:
-                            if start_ts is not None and end_ts is not None:
-                                dur_str = _format_duration(start_ts, end_ts)
-                                print(f"HYSTERESIS [{sensor_name}]: {start_ts} -> {end_ts} (duration {dur_str}) mean_abs={mean_diff:.2f} peak_abs={peak_diff:.2f}")
-                            else:
-                                # Fallback formatting when timestamps are not available
-                                dur_str = f"{int(duration_td.total_seconds())}s" if duration_td is not None else 'unknown'
-                                print(f"HYSTERESIS [{sensor_name}]: idx-range (duration {dur_str}) mean_abs={mean_diff:.2f} peak_abs={peak_diff:.2f}")
-                        except Exception:
-                            print(f"HYSTERESIS [{sensor_name}]: period (duration unknown) mean_abs={mean_diff:.2f} peak_abs={peak_diff:.2f}")
+            # Hysteresis periods detected; detailed printing suppressed. The
+            # `hysteresis` dict is still produced and can be exported to CSV by
+            # a follow-up change if machine-readable output is desired.
         except Exception:
             pass
 
         # --- Plotting using df_clean so spikes are not graphed ---
+        # Compute data-driven y-limits/ticks from the difference dataframe so
+        # plots are centered on the actual spread of the data instead of a
+        # hard-coded range. This produces tighter y-limits when the data
+        # occupies a smaller range (e.g. most temperature diffs within -2..2).
+        try:
+            flat = diff_df.to_numpy().ravel()
+            finite = flat[np.isfinite(flat)]
+            if finite.size > 0:
+                dmin = float(np.nanmin(finite))
+                dmax = float(np.nanmax(finite))
+                if dmin == dmax:
+                    # Single-value series: provide a small pad so the line is visible
+                    pad = max(abs(dmin) * 0.1, 0.5)
+                else:
+                    pad = max((dmax - dmin) * 0.1, 0.25)
+                y_min_data = dmin - pad
+                y_max_data = dmax + pad
+                # Choose a reasonable tick step based on span
+                span = y_max_data - y_min_data
+                raw_step = span / 6.0 if span > 0 else 1.0
+                if raw_step <= 0.1:
+                    step = 0.05
+                elif raw_step <= 0.25:
+                    step = 0.1
+                elif raw_step <= 0.5:
+                    step = 0.25
+                elif raw_step <= 1.0:
+                    step = 0.5
+                else:
+                    # round to nearest 1, 2, 5, 10-like step
+                    magnitude = 10 ** math.floor(math.log10(raw_step))
+                    step = math.ceil(raw_step / magnitude) * magnitude
+                # Build ticks aligned to step
+                y_low_tick = math.floor(y_min_data / step) * step
+                y_high_tick = math.ceil(y_max_data / step) * step
+                y_ticks = np.arange(y_low_tick, y_high_tick + step / 2.0, step)
+                # Ensure at least 3 ticks
+                if len(y_ticks) < 3:
+                    step = max(step / 2.0, 0.01)
+                    y_ticks = np.arange(y_low_tick, y_high_tick + step / 2.0, step)
+                y_min_rounded = float(y_ticks[0])
+                y_max_rounded = float(y_ticks[-1])
+        except Exception:
+            # Fall back to previously computed folder-wide limits
+            pass
+
+        # (temperature-specific clamp removed — axis selection is handled earlier)
+
         fig, ax1 = plt.subplots(figsize=(12, 6))
         for sensor in non_reference_sensors:
             diff_masked = diff_df[sensor]
@@ -1394,7 +1574,7 @@ def plot_reference_overlay(
             except Exception:
                 pass
             precision = sensor_precisions.get(sensor, float('nan')) if sensor_precisions is not None else float('nan')
-            label = f"{sensor} - {ref}"
+            label = f"{sensor} - ref"
             # Create interpolated dotted line to connect gaps and label it; then
             # plot the masked-smoothed series unlabeled underneath.
             try:
@@ -1415,7 +1595,7 @@ def plot_reference_overlay(
         ax1.axhline(0, color="black", linestyle="--", linewidth=1)
         ax1.set_xlabel("Time")
         units = get_unit_for_instrument(instrument)
-        ylabel = f"Difference from {ref} ({units})" if units else f"Difference from {ref}"
+        ylabel = f"Difference from ref ({units})" if units else f"Difference from ref"
         ax1.set_ylabel(ylabel)
         ax1.set_title(f"{instrument} - SENSOR DIFFERENCES + REF OVERLAY (SMOOTHED) ({csv_path.stem})")
         ax1.set_ylim(y_min_rounded, y_max_rounded)
@@ -1440,9 +1620,10 @@ def plot_reference_overlay(
         except Exception:
             ref_interp = ref_trim
         # Plot interpolated dotted reference (labelled)
-        safe_plot(ax2, time_trim_ref, ref_interp, csv_path=csv_path, sensor_name=f"REF: {ref}", label=f"REF: {ref}", linestyle=':', color='red', alpha=0.9, zorder=2)
+        # Show a compact REF label (do not print full column name in the legend)
+        safe_plot(ax2, time_trim_ref, ref_interp, csv_path=csv_path, sensor_name="REF", label="REF", linestyle=':', color='red', alpha=0.9, zorder=2)
         # Plot original reference samples as unlabeled markers
-        safe_plot(ax2, time_trim_ref, ref_trim, csv_path=csv_path, sensor_name=f"REF: {ref} (points)", label=None, linestyle='none', marker='o', markersize=3, color='red', alpha=0.8, zorder=3)
+        safe_plot(ax2, time_trim_ref, ref_trim, csv_path=csv_path, sensor_name="REF", label=None, linestyle='none', marker='o', markersize=3, color='red', alpha=0.8, zorder=3)
     # Force ref axis to 0..100 with 10-unit ticks and set axis label with units
         rmin_rounded = 0
         rmax_rounded = 100
@@ -1518,16 +1699,58 @@ def plot_reference_overlay(
         ax2.yaxis.grid(False)
 
     else:
+        # Non-humidity instruments: compute data-driven y-limits based on
+        # the actual sensor - reference differences, then plot.
+        try:
+            diffs = []
+            for sensor in non_reference_sensors:
+                y_sensor = pd.to_numeric(df_clean[sensor], errors="coerce")
+                diffs.append((y_sensor - ref_numeric).to_numpy())
+            if diffs:
+                allvals = np.concatenate([d.ravel() for d in diffs])
+                finite = allvals[np.isfinite(allvals)]
+                if finite.size > 0:
+                    dmin = float(np.nanmin(finite))
+                    dmax = float(np.nanmax(finite))
+                    if dmin == dmax:
+                        pad = max(abs(dmin) * 0.1, 0.5)
+                    else:
+                        pad = max((dmax - dmin) * 0.1, 0.25)
+                    y_min_data = dmin - pad
+                    y_max_data = dmax + pad
+                    span = y_max_data - y_min_data
+                    raw_step = span / 6.0 if span > 0 else 1.0
+                    if raw_step <= 0.1:
+                        step = 0.05
+                    elif raw_step <= 0.25:
+                        step = 0.1
+                    elif raw_step <= 0.5:
+                        step = 0.25
+                    elif raw_step <= 1.0:
+                        step = 0.5
+                    else:
+                        magnitude = 10 ** math.floor(math.log10(raw_step))
+                        step = math.ceil(raw_step / magnitude) * magnitude
+                    y_low_tick = math.floor(y_min_data / step) * step
+                    y_high_tick = math.ceil(y_max_data / step) * step
+                    y_ticks = np.arange(y_low_tick, y_high_tick + step / 2.0, step)
+                    y_min_rounded = float(y_ticks[0])
+                    y_max_rounded = float(y_ticks[-1])
+        except Exception:
+            pass
+
+        # (temperature-specific clamp removed — axis selection is handled earlier)
+
         # Non-humidity instruments: simple overlay plot (no smoothing)
         fig, ax1 = plt.subplots(figsize=(12, 6))
         for sensor in non_reference_sensors:
             y_sensor = pd.to_numeric(df_clean[sensor], errors="coerce")
             diff = y_sensor - ref_vals
-            safe_plot(ax1, time_vals, diff, csv_path=csv_path, sensor_name=sensor, label=f"{sensor} - {ref}", alpha=0.8, zorder=1, color=sensor_colors.get(sensor, None))
+            safe_plot(ax1, time_vals, diff, csv_path=csv_path, sensor_name=sensor, label=f"{sensor} - ref", alpha=0.8, zorder=1, color=sensor_colors.get(sensor, None))
         ax1.axhline(0, color="black", linestyle="--", linewidth=1)
         ax1.set_xlabel("Time")
         units = get_unit_for_instrument(instrument)
-        ylabel = f"Difference from {ref} ({units})" if units else f"Difference from {ref}"
+        ylabel = f"Difference from ref ({units})" if units else f"Difference from ref"
         ax1.set_ylabel(ylabel)
         ax1.set_title(f"{instrument} - SENSOR DIFFERENCES + REF OVERLAY ({csv_path.stem})")
         ax1.set_ylim(y_min_rounded, y_max_rounded)
@@ -1547,8 +1770,12 @@ def plot_reference_overlay(
         legend1, legend2 = place_legends_outside(fig, ax1, lines1, labels1, ax2, lines2, labels2)
     plt.draw()
 
-    plt.savefig(out_dir / f"allSensorsDiffRefOverlay_{csv_path.stem}.png", dpi=150, bbox_inches="tight")
-    print(f"✅ Saved: {out_dir / f'allSensorsDiffRefOverlay_{csv_path.stem}.png'}")
+    save_path = out_dir / f"{instrument}_allSensorsDiffRefOverlay_{csv_path.stem}.png"
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"✅ Saved: {save_path}")
+    # Diagnostic tick/data printing for reference overlay removed to keep
+    # output compact. If you want machine-readable diagnostics, I can add
+    # an optional CSV export for these metrics in the next change.
     plt.close()
 def main(
     source_root: Path = SOURCE_ROOT,
